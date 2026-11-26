@@ -29,10 +29,8 @@ from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2ForCausalLM,
 )
 from afd_plugin.v1.worker.cuda_graph import make_ffn_graph_key  # noqa: E402
-from afd_plugin.v1.worker.ffn_model_runner import (  # noqa: E402
-    GPUFFNModelRunner,
-    _set_moe_layer_index,
-)
+from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner  # noqa: E402
+from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index  # noqa: E402
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
 from tests.unit.fakes.dp_metadata import (  # noqa: E402
     DPMetadataValues as _FakeDPMetadata,
@@ -241,6 +239,8 @@ class _FakeModel:
         return ()
 
     def compute_ffn_output(self, hidden_states, layer_idx):
+        assert torch.is_inference_mode_enabled()
+        assert not torch.is_grad_enabled()
         return f"ffn({hidden_states}, layer={layer_idx})"
 
 

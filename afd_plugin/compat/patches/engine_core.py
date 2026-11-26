@@ -688,6 +688,12 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
             "AFD FFN EngineCore started; workers run connector loop."
         )
         while _is_running(self, core_module):
+            # The launcher issues reset_mm_cache before installing its normal
+            # signal handler. Serve queued utility RPCs while FFN work remains
+            # connector-driven; otherwise the launcher never finishes startup.
+            queued_request = self.input_queue.get_nowait() if self.input_queue.qsize() else None
+            if queued_request is not None:
+                self._handle_client_request(*queued_request)
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
             time.sleep(0.5)
     except KeyboardInterrupt:

@@ -6,12 +6,20 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
-
 if TYPE_CHECKING:
     from argparse import ArgumentParser, Namespace
 
     from afd_plugin.ffn_faas.service import FFNService
+
+
+class FFNStepResult(StrEnum):
+    """Observable result of one connector-driven receiver iteration."""
+
+    WORK = "work"
+    WARMUP = "warmup"
+    STOP = "stop"
 
 
 class FFNBackend(Protocol):
@@ -21,7 +29,9 @@ class FFNBackend(Protocol):
 
     def start_receiver(self) -> None: ...
 
-    def execute_step(self) -> None: ...
+    def execute_step(self) -> FFNStepResult: ...
+
+    def request_stop(self) -> None: ...
 
     def receiver_exited(self) -> None: ...
 
@@ -43,6 +53,8 @@ class FFNLaunch:
 
 class FFNPlatformAdapter(Protocol):
     """Build the selected CLI and describe a launch without constructing a backend."""
+
+    backend_name: str
 
     def create_parser(self) -> ArgumentParser: ...
 

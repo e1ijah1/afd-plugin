@@ -177,6 +177,24 @@ def test_cpu_entry_rejects_platform_imports(
     assert "platform stub ran" not in result.stderr
 
 
+def test_standalone_platform_selection_accepts_only_implemented_backend():
+    from afd_plugin.ffn_faas.platforms import get_platform_adapter
+    from afd_plugin.ffn_faas.platforms.npu.adapter import AscendCAMAdapter
+
+    assert isinstance(get_platform_adapter("ascend-cam"), AscendCAMAdapter)
+    from afd_plugin.ffn_faas.platforms.gpu.adapter import GPUP2PAdapter
+
+    assert isinstance(get_platform_adapter("gpu-p2p"), GPUP2PAdapter)
+
+
+@pytest.mark.parametrize("backend", ["P2pNcclAFDConnector", "cuda"])
+def test_standalone_platform_selection_rejects_unimplemented_backend(backend):
+    from afd_plugin.ffn_faas.platforms import get_platform_adapter
+
+    with pytest.raises(ValueError, match="unsupported standalone FFN backend"):
+        get_platform_adapter(backend)
+
+
 @pytest.fixture
 def engine_parser():
     pytest.importorskip("vllm")
@@ -273,3 +291,14 @@ def test_retired_standalone_engine_flags_are_rejected(engine_parser, flag):
     with pytest.raises(SystemExit) as error:
         engine_parser.parse_args(["serve", "/model", flag])
     assert error.value.code == 2
+
+
+def test_standalone_cli_preserves_ascend_backend_default(engine_parser):
+    parsed = engine_parser.parse_args(["serve", "/model"])
+    assert parsed.backend == "ascend-cam"
+
+
+
+def test_standalone_cli_accepts_gpu_backend(engine_parser):
+    parsed = engine_parser.parse_args(["serve", "/model", "--backend", "gpu-p2p"])
+    assert parsed.backend == "gpu-p2p"

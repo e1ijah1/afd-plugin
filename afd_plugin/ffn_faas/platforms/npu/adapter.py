@@ -30,9 +30,10 @@ def create_backend(
 
     return CAMFFNBackend(model, settings, args)
 
-
 class AscendCAMAdapter:
     """Keep model, quantization, topology and device options out of the host loop."""
+
+    backend_name = "ascend-cam"
 
     def create_parser(self) -> ArgumentParser:
         # Selected-platform imports: the Service/host entry stays CPU-only.

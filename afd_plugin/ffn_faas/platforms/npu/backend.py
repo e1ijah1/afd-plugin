@@ -8,6 +8,7 @@ No Worker, upstream ModelRunner, EngineCore, scheduler or KV cache is constructe
 
 from __future__ import annotations
 
+import threading
 from argparse import Namespace
 
 import torch
@@ -21,6 +22,7 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.ffn_faas.interfaces import FFNStepResult
 from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
 from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
 from afd_plugin.ffn_faas.platforms.npu.settings import FFNConfig
@@ -41,6 +43,7 @@ class CAMFFNBackend:
         self.model = model
         self.runtime: AsyncNPUFFNModelRunner | None = None
         self.connector: CAMAsyncAFDConnector | None = None
+        self._stop_requested = threading.Event()
 
     def prepare(self, service: FFNService) -> None:
         args = EngineArgs.from_cli_args(self.args)
@@ -78,8 +81,6 @@ class CAMFFNBackend:
             self.runtime.attach_model(
                 self.model, parameter_bytes=self.model.parameter_bytes
             )
-            # Reuse paired signatures, warmup, capture and Graph pools from
-            # the existing CAM implementation.
             self.runtime.initialize_afd_connector()
             self.environment.bind_host_threads(config)
             service.phase(
@@ -92,15 +93,26 @@ class CAMFFNBackend:
         """Select the device once on the receiving thread, as the Worker does."""
         self.environment.activate_thread()
 
-    def execute_step(self) -> None:
+    def execute_step(self) -> FFNStepResult:
         assert self.runtime is not None
-        self.runtime.execute_connector_driven_step()
+        if not self.runtime.execute_connector_driven_step(
+            shutdown_requested=self._stop_requested.is_set()
+        ):
+            return FFNStepResult.STOP
         if self.runtime.effective_mode == "eager":
             # Preserve the mature eager loop's completion fence.
             torch.npu.synchronize()
+        return FFNStepResult.WORK
+
+    def request_stop(self) -> None:
+        # Async CAM cannot cancel an in-flight device receive. The runtime
+        # observes this event only at its next safe step boundary.
+        self._stop_requested.set()
 
     def receiver_exited(self) -> None:
         assert self.runtime is not None
+        self.runtime.drain()
+        self.runtime.session.finish_receiver()
         self.runtime.mark_receiver_exited()
 
     def close(self) -> None:

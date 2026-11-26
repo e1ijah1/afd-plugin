@@ -13,6 +13,22 @@ from afd_plugin.ffn_faas.service import FFNService
 from tests.unit.fakes.ffn_faas import HostBackend
 
 
+def _wait_for_phase(service, expected):
+    observed = threading.Event()
+    original_phase = service.phase
+
+    def phase(value, **details):
+        original_phase(value, **details)
+        if value.value == expected:
+            observed.set()
+
+    service.phase = phase
+    if service.snapshot()["phase"] == expected:
+        return True
+    return observed.wait(timeout=5)
+
+
+
 @pytest.fixture
 def make_runner(tmp_path):
     def build(backend):
@@ -32,6 +48,51 @@ def test_successful_host_exit_releases_after_receiver_exit(
     assert service.snapshot()["phase"] == "stopped"
     assert service.snapshot()["resources_released"] is True
     assert backend.released
+
+
+def test_stop_during_receiver_activation_skips_ready(make_runner):
+    backend = HostBackend(stop_immediately=True)
+    runner, service = make_runner(backend)
+    phases = []
+    original_phase = service.phase
+
+    def record_phase(phase, **details):
+        phases.append(phase.value)
+        original_phase(phase, **details)
+
+    service.phase = record_phase
+    runner.run()
+
+    assert "ready" not in phases
+    assert service.snapshot()["phase"] == "stopped"
+    assert service.snapshot()["resources_released"] is True
+    assert backend.released
+
+
+def test_ready_waits_for_receiver_activation(make_runner):
+    backend = HostBackend(block=True)
+    runner, service = make_runner(backend)
+    done = threading.Event()
+
+    def run():
+        runner.run()
+        done.set()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert backend.activated.wait(timeout=5)
+        assert _wait_for_phase(service, "ready")
+        assert not backend.released
+        assert backend.entered.wait(timeout=5)
+        backend.release.set()
+        assert done.wait(timeout=5)
+        assert service.snapshot()["phase"] == "stopped"
+        assert backend.released
+    finally:
+        backend.release.set()
+        thread.join(timeout=5)
+
 
 
 @pytest.mark.parametrize("fail", ["prepare", "activate", "execute", "close"])
@@ -73,7 +134,24 @@ def test_pending_host_receiver_is_not_closed(make_runner):
         thread.join()
         assert backend.finished.wait(timeout=5)
 
-
+def test_host_stop_requests_backend_stop_before_release(make_runner):
+    backend = HostBackend(block=True)
+    runner, service = make_runner(backend)
+    thread = threading.Thread(target=runner.run)
+    thread.start()
+    try:
+        assert backend.entered.wait(timeout=5)
+        service.request_stop()
+        backend.release.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert service.snapshot()["phase"] == "stopped"
+        assert service.snapshot()["completed_batches"] in (0, 1)
+        assert backend.finished.is_set()
+        assert backend.released
+    finally:
+        backend.release.set()
+        thread.join(timeout=5)
 def test_stop_before_backend_construction_needs_no_platform(tmp_path):
     def unavailable():
         raise RuntimeError("no device backend is available")

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
-from afd_plugin.ffn_faas.interfaces import FFNLaunch
+from afd_plugin.ffn_faas.interfaces import FFNLaunch, FFNStepResult
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
 
 
@@ -76,12 +76,20 @@ class HostBackend:
     """Exercise host ownership rules, without simulating device completion."""
 
     def __init__(
-        self, *, stop_during_prepare: bool = False, fail: str = "", block: bool = False
+        self,
+        *,
+        stop_during_prepare: bool = False,
+        fail: str = "",
+        block: bool = False,
+        stop_immediately: bool = False,
     ) -> None:
         self.stop_during_prepare = stop_during_prepare
         self.fail = fail
         self.block = block
+        self.stop_immediately = stop_immediately
+        self.stop_requested = threading.Event()
         self.entered = threading.Event()
+        self.activated = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
         self.released = False
@@ -96,18 +104,29 @@ class HostBackend:
             service.request_stop()
 
     def start_receiver(self) -> None:
+        self.activated.set()
+        if self.stop_immediately:
+            assert self.service is not None
+            self.service.request_stop()
         if self.fail == "activate":
             raise RuntimeError("receiver activation failed")
 
-    def execute_step(self) -> None:
-        assert self.service is not None
+    def execute_step(self) -> FFNStepResult:
         self.entered.set()
         if self.block:
             self.release.wait()
         if self.fail == "execute":
             self.finished.set()
             raise RuntimeError("execute failed")
+        if self.stop_requested.is_set() or self.stop_immediately:
+            self.finished.set()
+            return FFNStepResult.STOP
         self.service.request_stop()
+        return FFNStepResult.WORK
+
+
+    def request_stop(self) -> None:
+        self.stop_requested.set()
 
     def receiver_exited(self) -> None:
         self.finished.set()
@@ -122,7 +141,7 @@ class HostBackend:
 
 class HostPlatformAdapter:
     """An independent CPU host contract; it has no model/device requirements."""
-
+    backend_name = "host-contract"
     def create_parser(self) -> ArgumentParser:
         return ArgumentParser()
 

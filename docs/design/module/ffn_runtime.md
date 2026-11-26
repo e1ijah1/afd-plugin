@@ -30,6 +30,7 @@ depends_on:
   - "compatibility_and_patches.md"
 validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
+  - "tests/unit/ffn_faas/platforms/ffn_model/qwen3_6/gpu/test_qwen_moe.py"
   - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py"
   - "tests/npu/test_async_cam_layered_w8a8.py"
   - "tests/unit/v1/worker/test_ffn_metadata.py"
@@ -218,6 +219,11 @@ starting its connector daemon when `enable_cpu_binding` is enabled. The
 EngineCore compatibility patch keeps FFN daemon mode out of upstream
 scheduler/KV-cache startup assumptions and selects the daemon busy loop. See
 [compatibility and patches](compatibility_and_patches.md).
+
+While the connector daemon drives FFN execution, the FFN EngineCore also
+dispatches queued client control requests. This allows the vLLM launcher to
+complete its startup cache reset; the GPU FFN runner owns no multimodal or
+encoder cache, so those resets have no state to clear.
 
 The worker owns the daemon thread, shutdown event, and captured loop error.
 The model runner owns the model, connector, profiler, and graph cache. The

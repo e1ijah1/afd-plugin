@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import queue
 import sys
 import types
 from enum import IntEnum
@@ -84,6 +85,10 @@ def _install_fake_vllm_core(
 
     class EngineCoreProc(EngineCore):
         last_counts: tuple[int, int]
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.input_queue = queue.Queue()
 
         def run_busy_loop(self):
             self.original_run_busy_loop_called = True

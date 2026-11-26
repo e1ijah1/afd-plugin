@@ -30,7 +30,12 @@ def create_parser(adapter: FFNPlatformAdapter) -> argparse.ArgumentParser:
     parser.description = __doc__
     parser.add_argument("command", choices=["serve"])
     parser.add_argument("model_tag", nargs="?", help="local model checkpoint")
-    parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="ascend-cam")
+    parser.add_argument(
+        "--backend",
+        choices=SUPPORTED_BACKENDS,
+        default=adapter.backend_name,
+    )
+
     parser.add_argument(
         "--receiver-shutdown-timeout",
         type=float,
@@ -45,11 +50,9 @@ def create_parser(adapter: FFNPlatformAdapter) -> argparse.ArgumentParser:
 
 def main() -> int:
     selection = argparse.ArgumentParser(add_help=False)
-    selection.add_argument(
-        "--backend", choices=SUPPORTED_BACKENDS, default="ascend-cam"
-    )
+    selection.add_argument("--backend", choices=SUPPORTED_BACKENDS)
     selected, _ = selection.parse_known_args()
-    adapter = get_platform_adapter(selected.backend)
+    adapter = get_platform_adapter(selected.backend or "ascend-cam")
     parser = create_parser(adapter)
     args = parser.parse_args()
     try:
