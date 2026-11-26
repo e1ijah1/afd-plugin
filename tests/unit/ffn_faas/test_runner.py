@@ -8,6 +8,7 @@ import threading
 
 import pytest
 
+from afd_plugin.ffn_faas.interfaces import FFNStepResult
 from afd_plugin.ffn_faas.runner import FFNModelRunner
 from afd_plugin.ffn_faas.service import FFNService
 from tests.unit.fakes.ffn_faas import HostBackend
@@ -32,6 +33,87 @@ def test_successful_host_exit_releases_after_receiver_exit(
     assert service.snapshot()["phase"] == "stopped"
     assert service.snapshot()["resources_released"] is True
     assert backend.released
+
+
+def test_ready_waits_for_receiver_activation(make_runner):
+    backend = HostBackend(block=True, cancellable=True)
+    runner, service = make_runner(backend)
+    runner.shutdown_timeout = 5
+    entered = threading.Event()
+    activate = threading.Event()
+    done = threading.Event()
+
+    def start_receiver():
+        entered.set()
+        assert activate.wait(timeout=5)
+
+    backend.start_receiver = start_receiver
+    thread = threading.Thread(target=lambda: (runner.run(), done.set()))
+    thread.start()
+    try:
+        assert entered.wait(timeout=5)
+        assert service.snapshot()["phase"] != "ready"
+        activate.set()
+        assert backend.entered.wait(timeout=5)
+        assert service.snapshot()["phase"] == "ready"
+        service.request_stop()
+        assert done.wait(timeout=5)
+        assert service.snapshot()["resources_released"] is True
+    finally:
+        activate.set()
+        backend.release.set()
+        thread.join(timeout=5)
+
+
+def test_stop_during_receiver_activation_does_not_publish_ready(make_runner):
+    backend = HostBackend()
+    runner, service = make_runner(backend)
+    phases = []
+    original_phase = service.phase
+
+    def record_phase(phase, **details):
+        phases.append(phase.value)
+        original_phase(phase, **details)
+
+    def start_receiver():
+        service.request_stop()
+
+    service.phase = record_phase
+    backend.start_receiver = start_receiver
+    runner.run()
+    assert "ready" not in phases
+    assert service.snapshot()["resources_released"] is True
+
+
+def test_stop_during_receiver_activation_does_not_start_a_step(make_runner):
+    class StopOnActivationBackend(HostBackend):
+        def start_receiver(self):
+            assert self.service is not None
+            self.service.request_stop()
+
+        def execute_step(self):
+            raise AssertionError("backend must not receive work after an early stop")
+
+    backend = StopOnActivationBackend()
+    runner, service = make_runner(backend)
+    runner.run()
+    assert service.snapshot()["resources_released"] is True
+
+
+def test_warmup_steps_are_not_counted_as_completed_work(make_runner):
+    class WarmupBackend(HostBackend):
+        def __init__(self):
+            super().__init__()
+            self.results = iter((FFNStepResult.WARMUP, FFNStepResult.WORK, FFNStepResult.STOP))
+
+        def execute_step(self):
+            return next(self.results)
+
+    backend = WarmupBackend()
+    runner, service = make_runner(backend)
+    runner.run()
+    assert service.snapshot()["completed_batches"] == 1
+    assert service.snapshot()["resources_released"] is True
 
 
 @pytest.mark.parametrize("fail", ["prepare", "activate", "execute", "close"])

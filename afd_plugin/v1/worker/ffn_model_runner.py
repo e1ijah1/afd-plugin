@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -13,7 +12,7 @@ from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config import update_config as update_vllm_config
 from vllm.distributed.parallel_state import get_world_group, graph_capture
-from vllm.forward_context import DPMetadata, get_forward_context, set_forward_context
+from vllm.forward_context import DPMetadata
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import DeviceMemoryProfiler
@@ -38,11 +37,7 @@ from afd_plugin.v1.worker.cuda_graph import (
     graph_run_mode,
     make_ffn_graph_key,
 )
-from afd_plugin.v1.worker.ffn_metadata import (
-    _set_moe_layer_index,
-    aggregate_ffn_token_counts,
-    project_ffn_token_counts_to_dp,
-)
+from afd_plugin.v1.worker.ffn_step import execute_ffn_forward_step
 
 if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
@@ -263,140 +258,18 @@ class GPUFFNModelRunner:
         is_graph_replaying: bool = False,
         update_connector_state: bool = True,
     ) -> torch.Tensor | None:
-        if update_connector_state:
-            self._update_connector_state(
-                dp_metadata_list,
-                is_graph_capturing=is_graph_capturing,
-                is_warmup=is_warmup,
-                is_graph_replaying=is_graph_replaying,
-            )
-
-        model = self.get_model()
-        rank_ffn_output = None
-        num_layers = max(int(self.num_layers or 0), 1)
-        experts_layer_indices = frozenset(
-            model.get_experts_layer_indices(),
+        return execute_ffn_forward_step(
+            vllm_config=self.vllm_config,
+            afd_config=self.afd_config,
+            connector=self.connector,
+            model=self.get_model(),
+            num_layers=self.num_layers,
+            dp_metadata_list=dp_metadata_list,
+            is_graph_capturing=is_graph_capturing,
+            is_warmup=is_warmup,
+            is_graph_replaying=is_graph_replaying,
+            update_connector_state=update_connector_state,
         )
-        layer_indices = (
-            tuple(sorted(experts_layer_indices))
-            if self.afd_config.compute_gate_on_attention
-            else tuple(range(num_layers))
-        )
-        stage_ids = sorted(int(stage_idx) for stage_idx in dp_metadata_list) or [0]
-        ffn_dp_metadata_list = {
-            stage_idx: self._make_ffn_dp_metadata(dp_metadata_list[stage_idx])
-            for stage_idx in stage_ids
-        }
-        # The wire slot carries one payload: either token ids or Attention-side
-        # routing. Routing wins when the model declares it, because a sync
-        # gate-on-Attention model does not need ids on the FFN side at all.
-        recv_routing = getattr(model, "afd_requires_attention_routing", False)
-        recv_input_ids = (
-            False if recv_routing else getattr(model, "afd_requires_input_ids", False)
-        )
-        with _ffn_forward_context(self.vllm_config) as forward_context:
-            for layer_idx in layer_indices:
-                uses_remote_experts = layer_idx in experts_layer_indices
-                routing_spec = (
-                    model.get_experts_routing_spec(layer_idx)
-                    if uses_remote_experts and self.afd_config.compute_gate_on_attention
-                    else None
-                )
-                for stage_idx in stage_ids:
-                    recv_kwargs: dict[str, Any] = {}
-                    if routing_spec is not None:
-                        recv_kwargs["routing_spec"] = routing_spec
-                    if recv_routing:
-                        recv_kwargs["recv_routing"] = True
-                    elif recv_input_ids:
-                        recv_kwargs["recv_input_ids"] = True
-                    payload = self.connector.recv_attn_output(
-                        ubatch_idx=stage_idx,
-                        **recv_kwargs,
-                    )
-                    hidden_states = payload.hidden_states
-                    context = payload.context
-                    metadata = context.metadata
-                    metadata.layer_idx = layer_idx
-                    metadata.stage_idx = stage_idx
-                    if forward_context is not None:
-                        forward_context.dp_metadata = ffn_dp_metadata_list[
-                            metadata.stage_idx
-                        ]
-                        forward_context.additional_kwargs["afd_metadata"] = metadata
-                        _set_moe_layer_index(forward_context, layer_idx)
-                    if (
-                        uses_remote_experts
-                        and self.afd_config.compute_gate_on_attention
-                    ):
-                        router_logits = payload.router_logits
-                        assert router_logits is not None
-                        rank_ffn_output = model.compute_experts_output(
-                            hidden_states,
-                            layer_idx,
-                            router_logits,
-                        )
-                    else:
-                        rank_ffn_output = self._execute_eager_mode(
-                            hidden_states,
-                            layer_idx,
-                            input_ids=payload.input_ids,
-                        )
-                    self.connector.send_ffn_output(rank_ffn_output, context)
-        return rank_ffn_output
-
-    def _update_connector_state(
-        self,
-        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata],
-        *,
-        is_graph_capturing: bool,
-        is_warmup: bool,
-        is_graph_replaying: bool,
-    ) -> None:
-        cast(
-            AFDControlPlane, self.connector.control_plane
-        ).update_state_from_dp_metadata(
-            _make_dp_metadata_payload(
-                dp_metadata_list,
-                is_graph_capturing=is_graph_capturing,
-                is_warmup=is_warmup,
-                is_graph_replaying=is_graph_replaying,
-            ),
-        )
-
-    def _execute_eager_mode(
-        self,
-        hidden_states: torch.Tensor,
-        layer_idx: int,
-        *,
-        input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        model = self.get_model()
-        if input_ids is None:
-            return model.compute_ffn_output(hidden_states, layer_idx)
-        return model.compute_ffn_output(
-            hidden_states,
-            layer_idx,
-            input_ids=input_ids,
-        )
-
-    def _make_ffn_dp_metadata(
-        self,
-        dp_metadata: DPMetadata | AFDDPMetadata,
-    ) -> AFDDPMetadata:
-        attention_counts = tuple(
-            int(count) for count in dp_metadata.num_tokens_across_dp_cpu
-        )
-        ffn_counts = aggregate_ffn_token_counts(
-            attention_counts,
-            attention_size=int(self.connector.attn_size),
-            ffn_size=int(self.connector.ffn_size),
-        )
-        dp_counts = project_ffn_token_counts_to_dp(
-            ffn_counts,
-            dp_size=int(self.vllm_config.parallel_config.data_parallel_size),
-        )
-        return AFDDPMetadata(num_tokens_across_dp_cpu=dp_counts)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         for config_name, config_overrides in overrides.items():
@@ -555,12 +428,6 @@ class GPUFFNModelRunner:
 def _resolve_world_ranks() -> tuple[int, int]:
     group = get_world_group()
     return int(group.rank), int(group.local_rank)
-
-
-@contextmanager
-def _ffn_forward_context(vllm_config: VllmConfig):
-    with set_forward_context(attn_metadata=None, vllm_config=vllm_config):
-        yield get_forward_context()
 
 
 def _make_dp_metadata_payload(

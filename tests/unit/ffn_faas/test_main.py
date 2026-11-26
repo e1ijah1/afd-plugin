@@ -273,3 +273,8 @@ def test_retired_standalone_engine_flags_are_rejected(engine_parser, flag):
     with pytest.raises(SystemExit) as error:
         engine_parser.parse_args(["serve", "/model", flag])
     assert error.value.code == 2
+
+
+def test_standalone_cli_accepts_gpu_p2p(engine_parser):
+    parsed = engine_parser.parse_args(["serve", "/model", "--backend", "gpu-p2p"])
+    assert parsed.backend == "gpu-p2p"

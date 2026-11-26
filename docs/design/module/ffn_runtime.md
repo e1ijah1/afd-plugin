@@ -8,6 +8,7 @@ owners:
 primary_code_paths:
   - "afd_plugin/ffn_faas/**"
   - "afd_plugin/v1/worker/ffn_metadata.py"
+  - "afd_plugin/v1/worker/ffn_step.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
   - "afd_plugin/v1/worker/ffn_routed_experts_model_runner.py"
   - "afd_plugin/v1/worker/ffn_worker.py"
@@ -30,6 +31,8 @@ depends_on:
   - "compatibility_and_patches.md"
 validation_paths:
   - "tests/unit/ffn_faas/test_*.py"
+  - "tests/unit/ffn_faas/platforms/gpu/p2p/test_*.py"
+  - "tests/unit/ffn_faas/platforms/ffn_model/qwen3_6/gpu/test_*.py"
   - "tests/gpu/test_ffn_faas_gpu.py"
   - "tests/unit/connectors/npu/async_cam_runtime/test_async_cam_layered.py"
   - "tests/unit/v1/worker/test_async_ffn_runtime.py"
@@ -190,19 +193,25 @@ F, `--backend gpu-deepep-m2n`, under `ffn_faas/platforms/gpu/`:
   CUDA graphs are captured lazily from Attention's payloads, as on the Worker
   path, so `/ready` means paired and receiving.
 
-`FFNBackend.execute_step()` returns `False` only when `cancel_receive()` ended
-an idle receive; the host calls `cancel_receive()` after a stop request and
-before joining the receiver. The GPU backend closes the M2N control plane
-(aborting its own NCCL group); the NPU backend's `cancel_receive()` is a no-op.
+`FFNBackend.execute_step()` distinguishes work, warmup and requested stop;
+the host counts only work and publishes READY after receiver activation.
+`request_stop()` is nonblocking. The GPU M2N backend closes its control plane
+on a separate thread, while the NPU backend can stop only between submissions.
 Releasing DeepEP lanes is a barrier over every M2N rank, so a stopped GPU F
 completes its release when Attention shuts down too. See the
 [GPU standalone service guide](../../gpu/STANDALONE_FFN_SERVICE.md).
+
+The experimental `gpu-p2p` backend runs Qwen3.6 full MoE with F-only CUDA
+resources and the shared synchronous GPU FFN forward step. Its local idle
+receive cancellation is not a peer STOP/ACK or an in-flight shutdown protocol;
+formal numeric, lifecycle and release gates remain separate from a smoke test.
 
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` (any `AFDRoutedExpertsConnector`) |
 | CUDA standalone (`ffn_faas`, no Worker) | `DeepEPM2NFFNBackend` | `GPUFFNRoutedExpertsModelRunner` | `DeepEPM2NAFDConnector` |
+| CUDA standalone (`ffn_faas`, no Worker) | `GPUP2PFFNBackend` | shared eager FFN step | `P2pNcclAFDConnector` |
 | NPU standalone (`ffn_faas`, no Worker) | `CAMFFNBackend` | `AsyncNPUFFNModelRunner` | `CAMAsyncAFDConnector` |
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
@@ -342,10 +351,10 @@ daemon thread:
   -> repeat
 ```
 
-On CUDA, one iteration is `GPUFFNModelRunner.execute_connector_driven_step()`,
-shared by `AFDFFNWorker` and the standalone GPU FFN backend. It returns
-`False` only for a receive cancelled by a requested stop; a closed control
-plane without a stop request, and every other failure, raises.
+On CUDA, the Worker receives control payloads through
+`GPUFFNModelRunner.execute_connector_driven_step()`. Its synchronous forward
+and the standalone P2P backend share `execute_ffn_forward_step()`; a closed
+control plane without a stop request, and every other failure, raises.
 
 ### Connector-driven loop
 

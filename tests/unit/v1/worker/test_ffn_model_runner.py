@@ -29,10 +29,8 @@ from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDDeepseekV2ForCausalLM,
 )
 from afd_plugin.v1.worker.cuda_graph import make_ffn_graph_key  # noqa: E402
-from afd_plugin.v1.worker.ffn_model_runner import (  # noqa: E402
-    GPUFFNModelRunner,
-    _set_moe_layer_index,
-)
+from afd_plugin.v1.worker.ffn_metadata import _set_moe_layer_index  # noqa: E402
+from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner  # noqa: E402
 from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
 from tests.unit.fakes.dp_metadata import (  # noqa: E402
     DPMetadataValues as _FakeDPMetadata,
@@ -192,6 +190,7 @@ class _FakeConnector:
         self.expert_routing_specs = []
         self.recv_input_ids = []
         self.dp_metadata_updates = []
+        self.replay_updates = []
         self.closed = False
         self.attn_size = 1
         self.ffn_size = 1
@@ -201,6 +200,7 @@ class _FakeConnector:
 
     def update_state_from_dp_metadata(self, payload):
         assert isinstance(payload, AFDControlPayload)
+        self.replay_updates.append(payload.is_graph_replaying)
         self.dp_metadata_updates.append(
             (
                 dict(payload.dp_metadata_list),
@@ -725,11 +725,14 @@ def test_ffn_runner_cuda_graph_miss_falls_back_to_eager():
     metadata = _metadata()
     runner.connector.attn_outputs.append(_payload("hidden", metadata))
 
-    runner.execute_model(dp_metadata_list={0: _FakeDPMetadata([1])})
+    runner.execute_model(
+        dp_metadata_list={0: _FakeDPMetadata([1])}, is_graph_replaying=True
+    )
 
     assert runner.connector.ffn_outputs == [
         ("ffn(hidden, layer=0)", metadata),
     ]
+    assert runner.connector.replay_updates == [True]
 
 
 def test_ffn_runner_releases_owned_runtime_state_on_shutdown(monkeypatch):

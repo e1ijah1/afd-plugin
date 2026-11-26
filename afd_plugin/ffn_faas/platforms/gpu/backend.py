@@ -18,6 +18,7 @@ import torch
 from vllm.config import set_current_vllm_config
 
 from afd_plugin.connectors.gpu.deepep_m2n.connector import DeepEPM2NAFDConnector
+from afd_plugin.ffn_faas.interfaces import FFNStepResult
 from afd_plugin.ffn_faas.model_utils import parameter_storage_bytes
 from afd_plugin.ffn_faas.platforms.gpu.environment import GPUFFNEnvironment
 from afd_plugin.ffn_faas.platforms.gpu.settings import GPUFFNConfig
@@ -36,8 +37,7 @@ class DeepEPM2NFFNBackend:
     on the host thread; ``start_receiver``, ``execute_step`` and
     ``receiver_exited`` run on the receiver thread; ``close`` then releases
     the runtime, the compute groups and the weights, in that order.
-    ``cancel_receive`` can end an idle receive because the M2N control plane
-    owns an abortable NCCL group.
+    ``request_stop`` ends an idle receive through its NCCL control group.
     """
 
     def __init__(self, settings: GPUFFNConfig, args: Namespace) -> None:
@@ -48,6 +48,8 @@ class DeepEPM2NFFNBackend:
         self.runner: GPUFFNRoutedExpertsModelRunner | None = None
         self.model: RoutedExpertsModel | None = None
         self._cancel_requested = threading.Event()
+        self._cancel_thread: threading.Thread | None = None
+        self._cancel_error: BaseException | None = None
 
     def prepare(self, service: FFNService) -> None:
         """Bring this F rank from launch to paired with Attention.
@@ -140,37 +142,28 @@ class DeepEPM2NFFNBackend:
         """Select the GPU once on the receiving thread, as the Worker does."""
         self.environment.activate_thread()
 
-    def execute_step(self) -> bool:
-        """Run one control payload's step through the shared GPU runner method.
-
-        The runner ends every step with a device synchronize, so this method
-        adds no fence of its own.
-
-        Returns ``False`` only when ``cancel_receive`` closed the control
-        plane while the receive was idle. A closed control plane without a
-        cancel request, and any other error (including a DeepEP timeout after
-        a peer failed), raises and fails the service with owners retained.
-        """
+    def execute_step(self) -> FFNStepResult:
+        """Run one synchronized payload, or stop after receive cancellation."""
         assert self.runner is not None
-        return self.runner.execute_connector_driven_step(
+        completed = self.runner.execute_connector_driven_step(
             cancel_requested=self._cancel_requested.is_set
         )
+        return FFNStepResult.WORK if completed else FFNStepResult.STOP
 
-    def cancel_receive(self) -> None:
-        """End an idle control receive so a host stop can exit cleanly.
-
-        Records the request first, then closes the connector's control plane,
-        which aborts its dedicated NCCL control group; a blocked
-        ``recv_dp_metadata_list`` then raises ``AFDControlPlaneClosedError``
-        and ``execute_step`` returns ``False``. The DeepEP lane buffers keep
-        their own group, so a step already in flight still completes. Same
-        mechanism as ``AFDFFNWorker.stop_ffn_server_loop``.
-        """
+    def request_stop(self) -> None:
+        """End an idle receive without blocking the host on NCCL teardown."""
         self._cancel_requested.set()
-        if self.runner is not None:
-            control_plane = self.runner.connector.control_plane
-            if control_plane is not None:
-                control_plane.close()
+        self._cancel_thread = threading.Thread(target=self._cancel_receive, daemon=True)
+        self._cancel_thread.start()
+
+    def _cancel_receive(self) -> None:
+        try:
+            if self.runner is not None:
+                control_plane = self.runner.connector.control_plane
+                if control_plane is not None:
+                    control_plane.close()
+        except BaseException as error:
+            self._cancel_error = error
 
     def receiver_exited(self) -> None:
         """Record on the receiver thread that its loop ended cleanly."""
@@ -191,6 +184,12 @@ class DeepEPM2NFFNBackend:
         assert self.runner is not None
         if not self.runner.receiver_exited:
             raise RuntimeError("GPU FFN receiver has not exited; retain resources")
+        if self._cancel_thread is not None:
+            self._cancel_thread.join(timeout=self.settings.shutdown_timeout)
+            if self._cancel_thread.is_alive():
+                raise RuntimeError("GPU FFN cancellation is pending; retain resources")
+            if self._cancel_error is not None:
+                raise RuntimeError("GPU FFN cancellation failed; retain resources") from self._cancel_error
         self.runner.shutdown()
         self.environment.close()
         self.model = None

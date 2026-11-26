@@ -6,12 +6,21 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from argparse import ArgumentParser, Namespace
 
     from afd_plugin.ffn_faas.service import FFNService
+
+
+class FFNStepResult(StrEnum):
+    """Observable result of a connector-driven receiver iteration."""
+
+    WORK = "work"
+    WARMUP = "warmup"
+    STOP = "stop"
 
 
 class FFNBackend(Protocol):
@@ -21,23 +30,12 @@ class FFNBackend(Protocol):
 
     def start_receiver(self) -> None: ...
 
-    def execute_step(self) -> bool:
-        """Run one connector-driven step on the receiver thread.
-
-        Returns ``True`` after a completed step. Returns ``False`` only when a
-        ``cancel_receive()`` request ended an idle receive, so the host loop
-        exits cleanly; every other failure raises.
-        """
+    def execute_step(self) -> FFNStepResult:
+        """Run one step; distinguish work, warmup, and a requested stop."""
         ...
 
-    def cancel_receive(self) -> None:
-        """Unblock an idle receive after a host stop request.
-
-        Called on the host thread while the receiver thread may be blocked in
-        ``execute_step()``. A backend that cannot cancel a pending receive
-        implements this as a no-op; the host then reports the pending receive
-        and retains every owner.
-        """
+    def request_stop(self) -> None:
+        """Request stop without blocking the host thread on device work."""
         ...
 
     def receiver_exited(self) -> None: ...

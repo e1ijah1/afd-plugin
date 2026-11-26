@@ -8,6 +8,7 @@ No Worker, upstream ModelRunner, EngineCore, scheduler or KV cache is constructe
 
 from __future__ import annotations
 
+import threading
 from argparse import Namespace
 
 import torch
@@ -21,6 +22,7 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
+from afd_plugin.ffn_faas.interfaces import FFNStepResult
 from afd_plugin.ffn_faas.platforms.launch import reassert_external_launcher
 from afd_plugin.ffn_faas.platforms.npu.environment import AscendFFNEnvironment
 from afd_plugin.ffn_faas.platforms.npu.model import CAMRoutedModel
@@ -42,6 +44,7 @@ class CAMFFNBackend:
         self.model = model
         self.runtime: AsyncNPUFFNModelRunner | None = None
         self.connector: CAMAsyncAFDConnector | None = None
+        self._stop_requested = threading.Event()
 
     def prepare(self, service: FFNService) -> None:
         args = EngineArgs.from_cli_args(self.args)
@@ -93,25 +96,19 @@ class CAMFFNBackend:
         """Select the device once on the receiving thread, as the Worker does."""
         self.environment.activate_thread()
 
-    def execute_step(self) -> bool:
-        """Run one CAM submission batch; a CAM receive never reports a cancel.
-
-        The return value follows ``FFNBackend.execute_step``: CAM cannot end a
-        pending receive, so a completed batch always returns ``True``.
-        """
+    def execute_step(self) -> FFNStepResult:
+        """Run one CAM submission batch or stop at a safe step boundary."""
         assert self.runtime is not None
+        if self._stop_requested.is_set():
+            return FFNStepResult.STOP
         self.runtime.execute_connector_driven_step()
         if self.runtime.effective_mode == "eager":
-            # Preserve the mature eager loop's completion fence.
             torch.npu.synchronize()
-        return True
+        return FFNStepResult.WORK
 
-    def cancel_receive(self) -> None:
-        """No-op: a pending CAM receive cannot be cancelled.
-
-        The host join then times out, reports the pending receive and retains
-        every owner, exactly as before ``cancel_receive`` existed.
-        """
+    def request_stop(self) -> None:
+        """Stop between submissions; CAM cannot cancel a pending receive."""
+        self._stop_requested.set()
 
     def receiver_exited(self) -> None:
         assert self.runtime is not None

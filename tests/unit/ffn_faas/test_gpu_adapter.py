@@ -69,11 +69,12 @@ def configure(tmp_path):
     return run
 
 
-def test_backend_selection_imports_no_native_stack():
+@pytest.mark.parametrize("backend", ["gpu-deepep-m2n", "gpu-p2p"])
+def test_backend_selection_imports_no_native_stack(backend):
     script = (
         "import json, sys; "
         "from afd_plugin.ffn_faas.platforms import get_platform_adapter; "
-        "get_platform_adapter('gpu-deepep-m2n'); "
+        f"get_platform_adapter({backend!r}); "
         f"print(json.dumps([m for m in {NATIVE_MODULES!r} if m in sys.modules]))"
     )
     result = subprocess.run(

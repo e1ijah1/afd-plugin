@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
-from afd_plugin.ffn_faas.interfaces import FFNLaunch
+from afd_plugin.ffn_faas.interfaces import FFNLaunch, FFNStepResult
 from afd_plugin.ffn_faas.service import FFNService, ServicePhase
 
 
@@ -112,7 +112,7 @@ class HostBackend:
         """Configure one host-contract behavior.
 
         ``block`` keeps ``execute_step`` waiting like an idle receive;
-        ``cancellable`` lets ``cancel_receive`` end that wait the way the GPU
+        ``cancellable`` lets ``request_stop`` end that wait the way the GPU
         M2N control plane does; ``end_receive`` makes the first step report a
         cancelled receive without any host stop.
         """
@@ -124,6 +124,7 @@ class HostBackend:
         self.entered = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
+        self.stop_requested = threading.Event()
         self.cancelled = False
         self.released = False
         self.service: FFNService | None = None
@@ -140,24 +141,27 @@ class HostBackend:
         if self.fail == "activate":
             raise RuntimeError("receiver activation failed")
 
-    def execute_step(self) -> bool:
-        """Return ``False`` for a cancelled receive, else request a stop."""
+    def execute_step(self) -> FFNStepResult:
+        """Exercise the host step contract without a native device."""
         assert self.service is not None
+        if self.stop_requested.is_set():
+            return FFNStepResult.STOP
         self.entered.set()
         if self.end_receive:
-            return False
+            return FFNStepResult.STOP
         if self.block:
             self.release.wait()
             if self.cancelled:
-                return False
+                return FFNStepResult.STOP
         if self.fail == "execute":
             self.finished.set()
             raise RuntimeError("execute failed")
         self.service.request_stop()
-        return True
+        return FFNStepResult.WORK
 
-    def cancel_receive(self) -> None:
-        """End a blocked receive only when this fake models a cancellable one."""
+    def request_stop(self) -> None:
+        """End a blocked receive only when this fake is cancellable."""
+        self.stop_requested.set()
         if self.cancellable:
             self.cancelled = True
             self.release.set()

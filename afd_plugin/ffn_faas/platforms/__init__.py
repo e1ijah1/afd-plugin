@@ -12,7 +12,8 @@ if TYPE_CHECKING:
     from afd_plugin.ffn_faas.interfaces import FFNPlatformAdapter
 
 ASCEND_CAM_BACKEND = "ascend-cam"
-SUPPORTED_BACKENDS = (ASCEND_CAM_BACKEND, GPU_DEEPEP_M2N_BACKEND)
+GPU_P2P_BACKEND = "gpu-p2p"
+SUPPORTED_BACKENDS = (ASCEND_CAM_BACKEND, GPU_DEEPEP_M2N_BACKEND, GPU_P2P_BACKEND)
 
 
 def get_platform_adapter(name: str) -> FFNPlatformAdapter:
@@ -29,4 +30,8 @@ def get_platform_adapter(name: str) -> FFNPlatformAdapter:
         from afd_plugin.ffn_faas.platforms.gpu.adapter import GPUDeepEPM2NAdapter
 
         return GPUDeepEPM2NAdapter()
+    if name == GPU_P2P_BACKEND:
+        from afd_plugin.ffn_faas.platforms.gpu.p2p.adapter import GPUP2PAdapter
+
+        return GPUP2PAdapter()
     raise ValueError(f"unsupported standalone FFN backend: {name}")
